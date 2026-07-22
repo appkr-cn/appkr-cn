@@ -1,0 +1,26 @@
+---
+layout: home
+
+hero:
+  name: "AppKr"
+  text: "AI · Agent · Skills"
+  tagline: 探索人工智能、智能体与技能的无限可能
+  actions:
+    - theme: brand
+      text: aiAgents 导航
+      link: /aiAgents/
+    - theme: alt
+      text: GitHub
+      link: https://github.com/appkr-cn
+
+features:
+  - title: AI 平台
+    details: 汇集全球顶尖 AI 模型与平台，从 ChatGPT、Claude 到国内文心一言、通义千问等。
+    link: /aiAgents/ai
+  - title: Agent 框架
+    details: 收录主流 Agent 开发框架，如 AutoGPT、LangChain、MetaGPT 等，助你快速构建智能体。
+    link: /aiAgents/agent
+  - title: Skills & Tools
+    details: 整理 AI 生态中的实用工具、插件与技能集，包括 MCP、浏览器自动化、代码助手等。
+    link: /aiAgents/skills
+---
