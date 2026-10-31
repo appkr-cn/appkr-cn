@@ -1,0 +1,15 @@
+node_modules
+yarn-error.log
+.idea
+.DS_Store
+.vscode
+package-lock.json
+lib
+libs
+dist
+*.tsbuildinfo
+**/.vuepress/.cache
+**/.vuepress/.temp
+.workbuddy
+.deploy-tmp*
+.git-files.txt
