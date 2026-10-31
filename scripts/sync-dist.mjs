@@ -1,15 +1,28 @@
 #!/usr/bin/env node
 /**
- * 将构建产物目录同步到 GitHub 仓库指定分支（等效于强推，保留单次提交）
+ * 把本地目录同步到 GitHub 仓库的指定分支（等效于强推，只留一次提交）
  *
- * 用于 git push 被网络策略阻断、但 REST API 可用的环境。
+ * 适用于 git push 被网络策略阻断、但 REST API 可用的环境：
+ * 通过 Git Data API 创建 blob / tree / commit，再强制更新 ref。
+ * 会先比对远端现有树，只上传内容有变化的文件。
  *
  * 用法:
- *   GH_TOKEN=xxx node scripts/sync-dist.mjs [产物目录] [分支]
+ *   GH_TOKEN=xxx node scripts/sync-dist.mjs [目录] [分支]
+ *
  * 环境变量:
- *   REPO   仓库，默认 appkr-cn/appkr-cn
- *   BRANCH 分支，默认 main
- *   MSG    提交信息
+ *   REPO             仓库，默认 appkr-cn/appkr-cn
+ *   BRANCH           分支，默认 main（也可用第二个命令行参数指定）
+ *   MSG              提交信息
+ *   FILELIST         仅同步清单内的文件（每行一个相对路径），用于同步源码
+ *   CONCURRENCY      并发数，默认 3
+ *   BLOB_INTERVAL_MS blob 上传最小间隔，默认 900ms，用于规避次级限流
+ *
+ * 示例:
+ *   # 同步构建产物
+ *   GH_TOKEN=xxx node scripts/sync-dist.mjs docs/.vuepress/dist gh-pages
+ *   # 同步源码（尊重 .gitignore）
+ *   git -c core.quotepath=false ls-files > .git-files.txt
+ *   GH_TOKEN=xxx FILELIST=.git-files.txt node scripts/sync-dist.mjs . main
  */
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
@@ -77,7 +90,7 @@ async function apiRetry(endpoint, options = {}, attempts = 6) {
   }
 }
 
-/** 计算 git blob 对象的 sha1（GitHub 的 blob sha 与之相同） */
+/** 计算 git blob 对象的 sha1（与 GitHub 的 blob sha 一致） */
 function hashBlob(buffer) {
   const header = Buffer.from(`blob ${buffer.length}\0`)
   return createHash('sha1').update(Buffer.concat([header, buffer])).digest('hex')
@@ -113,9 +126,25 @@ async function mapLimit(items, limit, fn) {
   return results
 }
 
+/** 读取远端某次提交的文件树，返回 path -> sha */
+async function remoteBlobMap(commitSha) {
+  try {
+    const commit = await api(`/repos/${REPO}/git/commits/${commitSha}`)
+    const tree = await api(`/repos/${REPO}/git/trees/${commit.tree.sha}?recursive=1`)
+    if (tree.truncated) return null
+    const map = new Map()
+    for (const entry of tree.tree) {
+      if (entry.type === 'blob') map.set(entry.path, entry.sha)
+    }
+    return map
+  } catch {
+    return null
+  }
+}
+
 async function main() {
   console.log(`仓库: ${REPO}  分支: ${BRANCH}`)
-  console.log(`产物: ${DIR}`)
+  console.log(`目录: ${DIR}`)
 
   const files = FILELIST
     ? (await readFile(FILELIST, 'utf8'))
@@ -132,58 +161,56 @@ async function main() {
   }
   console.log(`文件数: ${files.length}  总大小: ${(totalBytes / 1024 / 1024).toFixed(2)} MB`)
 
-  // 先按 git blob 规则在本地算出 sha，直接建树：已存在的 blob（内容未变）无需重复上传
-  const localEntries = await mapLimit(files, CONCURRENCY, async (file) => ({
-    path: file.rel,
-    mode: '100644',
-    type: 'blob',
-    sha: hashBlob(await readFile(file.full))
-  }))
+  const ref = await api(`/repos/${REPO}/git/ref/heads/${BRANCH}`).catch(() => null)
+  const parent = ref?.object.sha
+  const remote = parent ? await remoteBlobMap(parent) : null
+  console.log(remote ? `远端已有 ${remote.size} 个文件，将只上传变动部分` : '远端无可比对内容，全量上传')
 
-  let tree
-  try {
-    tree = await apiRetry(`/repos/${REPO}/git/trees`, {
+  let uploaded = 0
+  const entries = await mapLimit(files, CONCURRENCY, async (file) => {
+    const buffer = await readFile(file.full)
+    const sha = hashBlob(buffer)
+    if (remote && remote.get(file.rel) === sha) {
+      return { path: file.rel, mode: '100644', type: 'blob', sha }
+    }
+    await throttleBlob()
+    const blob = await apiRetry(`/repos/${REPO}/git/blobs`, {
       method: 'POST',
-      body: JSON.stringify({ tree: localEntries })
+      body: JSON.stringify({ content: buffer.toString('base64'), encoding: 'base64' })
     })
-    console.log('✓ 复用远端已有 blob，跳过上传')
-  } catch (error) {
-    console.log(`  需要上传新内容（${error.status || '?'}），逐文件上传…`)
-    let done = 0
-    const blobs = await mapLimit(files, CONCURRENCY, async (file) => {
-      const content = (await readFile(file.full)).toString('base64')
-      await throttleBlob()
-      const blob = await apiRetry(`/repos/${REPO}/git/blobs`, {
-        method: 'POST',
-        body: JSON.stringify({ content, encoding: 'base64' })
-      })
-      done += 1
-      if (done % 25 === 0 || done === files.length) {
-        console.log(`  已上传 ${done}/${files.length}`)
-      }
-      return { path: file.rel, mode: '100644', type: 'blob', sha: blob.sha }
-    })
+    uploaded += 1
+    if (uploaded % 10 === 0) console.log(`  已上传 ${uploaded} 个变动文件`)
+    return { path: file.rel, mode: '100644', type: 'blob', sha: blob.sha }
+  })
+  console.log(`上传完成：变动 ${uploaded} 个，复用 ${files.length - uploaded} 个`)
 
-    tree = await apiRetry(`/repos/${REPO}/git/trees`, {
-      method: 'POST',
-      body: JSON.stringify({ tree: blobs })
-    })
-  }
+  const tree = await apiRetry(`/repos/${REPO}/git/trees`, {
+    method: 'POST',
+    body: JSON.stringify({ tree: entries })
+  })
   console.log(`tree: ${tree.sha}`)
 
-  const ref = await api(`/repos/${REPO}/git/ref/heads/${BRANCH}`)
-  const parent = ref.object.sha
-
-  const commit = await api(`/repos/${REPO}/git/commits`, {
+  const commit = await apiRetry(`/repos/${REPO}/git/commits`, {
     method: 'POST',
-    body: JSON.stringify({ message: MESSAGE, tree: tree.sha, parents: [parent] })
+    body: JSON.stringify({
+      message: MESSAGE,
+      tree: tree.sha,
+      parents: parent ? [parent] : []
+    })
   })
   console.log(`commit: ${commit.sha}`)
 
-  await api(`/repos/${REPO}/git/refs/heads/${BRANCH}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ sha: commit.sha, force: true })
-  })
+  if (parent) {
+    await apiRetry(`/repos/${REPO}/git/refs/heads/${BRANCH}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ sha: commit.sha, force: true })
+    })
+  } else {
+    await apiRetry(`/repos/${REPO}/git/refs`, {
+      method: 'POST',
+      body: JSON.stringify({ ref: `refs/heads/${BRANCH}`, sha: commit.sha })
+    })
+  }
   console.log(`✓ 已更新 ${BRANCH} -> ${commit.sha}`)
   console.log(`  https://github.com/${REPO}/commit/${commit.sha}`)
 }
