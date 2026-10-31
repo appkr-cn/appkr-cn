@@ -12,6 +12,7 @@
  *   MSG    提交信息
  */
 import { readdir, readFile, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 
 const REPO = process.env.REPO || 'appkr-cn/appkr-cn'
@@ -76,6 +77,12 @@ async function apiRetry(endpoint, options = {}, attempts = 6) {
   }
 }
 
+/** 计算 git blob 对象的 sha1（GitHub 的 blob sha 与之相同） */
+function hashBlob(buffer) {
+  const header = Buffer.from(`blob ${buffer.length}\0`)
+  return createHash('sha1').update(Buffer.concat([header, buffer])).digest('hex')
+}
+
 /** 递归收集文件（相对路径） */
 async function collect(dir, base = '') {
   const entries = await readdir(dir, { withFileTypes: true })
@@ -125,25 +132,43 @@ async function main() {
   }
   console.log(`文件数: ${files.length}  总大小: ${(totalBytes / 1024 / 1024).toFixed(2)} MB`)
 
-  let done = 0
-  const blobs = await mapLimit(files, CONCURRENCY, async (file) => {
-    const content = (await readFile(file.full)).toString('base64')
-    await throttleBlob()
-    const blob = await apiRetry(`/repos/${REPO}/git/blobs`, {
-      method: 'POST',
-      body: JSON.stringify({ content, encoding: 'base64' })
-    })
-    done += 1
-    if (done % 25 === 0 || done === files.length) {
-      console.log(`  已上传 ${done}/${files.length}`)
-    }
-    return { path: file.rel, mode: '100644', type: 'blob', sha: blob.sha }
-  })
+  // 先按 git blob 规则在本地算出 sha，直接建树：已存在的 blob（内容未变）无需重复上传
+  const localEntries = await mapLimit(files, CONCURRENCY, async (file) => ({
+    path: file.rel,
+    mode: '100644',
+    type: 'blob',
+    sha: hashBlob(await readFile(file.full))
+  }))
 
-  const tree = await apiRetry(`/repos/${REPO}/git/trees`, {
-    method: 'POST',
-    body: JSON.stringify({ tree: blobs })
-  })
+  let tree
+  try {
+    tree = await apiRetry(`/repos/${REPO}/git/trees`, {
+      method: 'POST',
+      body: JSON.stringify({ tree: localEntries })
+    })
+    console.log('✓ 复用远端已有 blob，跳过上传')
+  } catch (error) {
+    console.log(`  需要上传新内容（${error.status || '?'}），逐文件上传…`)
+    let done = 0
+    const blobs = await mapLimit(files, CONCURRENCY, async (file) => {
+      const content = (await readFile(file.full)).toString('base64')
+      await throttleBlob()
+      const blob = await apiRetry(`/repos/${REPO}/git/blobs`, {
+        method: 'POST',
+        body: JSON.stringify({ content, encoding: 'base64' })
+      })
+      done += 1
+      if (done % 25 === 0 || done === files.length) {
+        console.log(`  已上传 ${done}/${files.length}`)
+      }
+      return { path: file.rel, mode: '100644', type: 'blob', sha: blob.sha }
+    })
+
+    tree = await apiRetry(`/repos/${REPO}/git/trees`, {
+      method: 'POST',
+      body: JSON.stringify({ tree: blobs })
+    })
+  }
   console.log(`tree: ${tree.sha}`)
 
   const ref = await api(`/repos/${REPO}/git/ref/heads/${BRANCH}`)
